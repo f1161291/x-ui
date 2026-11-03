@@ -86,10 +86,37 @@ elif [[ x"${release}" == x"ubuntu" ]]; then
         LOGE "请使用 Ubuntu 16 或更高版本的系统！\n" && exit 1
     fi
 elif [[ x"${release}" == x"debian" ]]; then
-    if [[ ${os_version} -lt 8 ]]; then
+    if [[ -n "${os_version}" ]] && [[ ${os_version} -lt 8 ]]; then
         LOGE "请使用 Debian 8 或更高版本的系统！\n" && exit 1
     fi
 fi
+
+# ----- CPU 架构识别 -----
+# Armbian / 树莓派 / 电视盒子常见 aarch64 / armv7l / armv8l。
+# 注意 armv8l 表示 64 位 SoC 跑 32 位用户态，必须按用户态位数区分，
+# 否则会静默回退成 amd64，安装后直接 Exec format error。
+if ! command -v uname >/dev/null 2>&1; then
+    LOGE "未找到 uname 命令，无法确定 CPU 架构！\n" && exit 1
+fi
+case "$(uname -m)" in
+    x86_64 | amd64 | x64)                 arch="amd64" ;;
+    aarch64 | arm64)                      arch="arm64" ;;
+    armv7l | armv7 | armhf | arm)         arch="armv7" ;;
+    armv8l)
+        if [[ "$(getconf LONG_BIT 2>/dev/null)" == "64" ]]; then
+            arch="arm64"
+        else
+            arch="armv7"
+        fi ;;
+    s390x)                                arch="s390x" ;;
+    *) LOGE "不支持的 CPU 架构: $(uname -m)，请自行编译 x-ui！\n" && exit 1 ;;
+esac
+# xray 二进制名：源码 xray/process.go 用 runtime.GOARCH，armv7 对应 bin/xray-linux-arm
+case "${arch}" in
+    armv7) xray_arch="arm" ;;
+    *)     xray_arch="${arch}" ;;
+esac
+LOGI "检测到系统: ${release:-unknown} / 架构: ${arch} / xray: ${xray_arch}"
 
 confirm() {
     if [[ $# > 1 ]]; then
@@ -121,8 +148,134 @@ before_show_menu() {
     show_menu
 }
 
+# 下载源：fork 若自行发布 release，改这里即可（默认沿用上游预编译包，含 arm64）
+XUI_REPO="${XUI_REPO:-FranzKafkaYu/x-ui}"
+# armv7 上游无预编译包时，可把自行编译好的包路径传给本变量跳过下载
+XUI_LOCAL_TARBALL="${XUI_LOCAL_TARBALL:-}"
+
+install_base() {
+    if [[ x"${release}" == x"centos" ]]; then
+        yum install -y wget curl tar jq cronie
+    else
+        # Armbian 最小镜像 apt 列表常为空，先 update
+        apt-get update -y
+        apt-get install -y -q wget curl tar jq cron
+    fi
+}
+
+# 安装后强制改端口/账户（上游同名逻辑，本仓库之前委托上游故缺失）
+config_after_install() {
+    echo -e "${yellow}出于安全考虑，安装/更新完成后需要强制修改端口与账户密码${plain}"
+    read -p "确认是否继续,如选择n则跳过本次端口与账户密码设定[y/n]:" config_confirm
+    if [[ x"${config_confirm}" == x"y" || x"${config_confirm}" == x"Y" ]]; then
+        read -p "请设置您的账户名:" config_account
+        echo -e "${yellow}您的账户名将设定为:${config_account}${plain}"
+        read -p "请设置您的账户密码:" config_password
+        echo -e "${yellow}您的账户密码将设定为:${config_password}${plain}"
+        read -p "请设置面板访问端口:" config_port
+        echo -e "${yellow}您的面板端口将设定为:${config_port}${plain}"
+        /usr/local/x-ui/x-ui setting -username ${config_account} -password ${config_password}
+        /usr/local/x-ui/x-ui setting -port ${config_port}
+        echo -e "${green}账户密码与端口设定完成${plain}"
+    else
+        echo -e "${red}已取消设定...${plain}"
+        if [[ ! -f "/etc/x-ui/x-ui.db" ]]; then
+            local usernameTemp=$(head -c 6 /dev/urandom | base64)
+            local passwordTemp=$(head -c 6 /dev/urandom | base64)
+            local portTemp=$(echo $RANDOM)
+            /usr/local/x-ui/x-ui setting -username ${usernameTemp} -password ${passwordTemp}
+            /usr/local/x-ui/x-ui setting -port ${portTemp}
+            echo -e "检测到您属于全新安装,出于安全考虑已自动为您生成随机用户与端口:"
+            echo -e "###############################################"
+            echo -e "${green}面板登录用户名:${usernameTemp}${plain}"
+            echo -e "${green}面板登录用户密码:${passwordTemp}${plain}"
+            echo -e "${red}面板登录端口:${portTemp}${plain}"
+            echo -e "###############################################"
+            echo -e "${red}如您遗忘了面板登录相关信息,可在安装完成后输入x-ui,输入选项7查看面板登录信息${plain}"
+        else
+            echo -e "${red}当前属于版本升级,保留之前设置项,登录方式保持不变${plain}"
+        fi
+    fi
+}
+
+# armv7 从源码编译（GOARCH=arm GOARM=7），并补 xray-linux-arm
+build_x-ui_from_source() {
+    cd /usr/local/ || exit 1
+    if [[ ! -d x-ui-src ]]; then
+        git clone --depth 1 "https://github.com/${XUI_REPO}.git" x-ui-src || return 1
+    fi
+    cd x-ui-src || return 1
+    GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -o x-ui . || return 1
+    # xray-core 官方 arm32-v7a 包
+    local xv=$(curl -Lsk "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    wget -N --no-check-certificate -O /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${xv}/Xray-linux-arm32-v7a.zip" || return 1
+    command -v unzip >/dev/null 2>&1 && unzip -o /tmp/xray.zip -d /tmp/xray-arm >/dev/null || return 1
+    mkdir -p bin
+    cp -f /tmp/xray-arm/xray bin/xray-linux-arm
+    chmod +x x-ui bin/xray-linux-arm
+    tar czf /usr/local/x-ui-linux-armv7.tar.gz x-ui bin
+    return 0
+}
+
+install_x-ui() {
+    systemctl stop x-ui 2>/dev/null
+    cd /usr/local/ || exit 1
+
+    if [[ "${arch}" == "armv7" ]] && [[ -z "${XUI_LOCAL_TARBALL}" ]]; then
+        if command -v go >/dev/null 2>&1; then
+            LOGI "检测到 armv7，本机已有 go，开始从源码编译 ..."
+            build_x-ui_from_source || { LOGE "源码编译失败，请检查 go 环境与网络。"; exit 1; }
+        else
+            LOGE "上游未提供 armv7 预编译包，且本机没有 go 环境，无法自动安装。\n"
+            LOGE "请自行编译后打包为 x-ui-linux-armv7.tar.gz，再执行：\n"
+            LOGE "  XUI_LOCAL_TARBALL=/path/to/x-ui-linux-armv7.tar.gz bash <(curl ...) \n"
+            LOGE "或改用 arm64 系统镜像（推荐）。\n"
+            exit 1
+        fi
+    fi
+
+    if [[ -n "${XUI_LOCAL_TARBALL}" ]]; then
+        last_version="local"
+        cp -f "${XUI_LOCAL_TARBALL}" /usr/local/x-ui-linux-${arch}.tar.gz
+        LOGI "使用本地安装包: ${XUI_LOCAL_TARBALL}"
+    elif [ $# == 0 ]; then
+        last_version=$(curl -Lsk "https://api.github.com/repos/${XUI_REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        if [[ -z "$last_version" ]]; then
+            LOGE "检测 x-ui 版本失败，可能是超出 Github API 限制，请稍后再试或手动指定版本安装。"
+            exit 1
+        fi
+        LOGI "检测到 x-ui 最新版本：${last_version}，开始安装"
+        wget -N --no-check-certificate -O /usr/local/x-ui-linux-${arch}.tar.gz "https://github.com/${XUI_REPO}/releases/download/${last_version}/x-ui-linux-${arch}.tar.gz"
+    else
+        last_version=$1
+        wget -N --no-check-certificate -O /usr/local/x-ui-linux-${arch}.tar.gz "https://github.com/${XUI_REPO}/releases/download/${last_version}/x-ui-linux-${arch}.tar.gz"
+    fi
+    if [[ $? -ne 0 ]]; then
+        LOGE "下载 x-ui 失败，请确认机器可访问 Github；armv7 请改用 XUI_LOCAL_TARBALL 或 arm64 镜像。"
+        exit 1
+    fi
+
+    rm -rf /usr/local/x-ui/
+    tar zxvf x-ui-linux-${arch}.tar.gz
+    rm -f x-ui-linux-${arch}.tar.gz
+    cd x-ui || exit 1
+    chmod +x x-ui bin/xray-linux-${xray_arch}
+    cp -f x-ui.service /etc/systemd/system/
+    wget --no-check-certificate -O /usr/bin/x-ui https://raw.githubusercontent.com/FranzKafkaYu/x-ui/main/x-ui.sh
+    chmod +x /usr/local/x-ui/x-ui.sh /usr/bin/x-ui
+    config_after_install
+    systemctl daemon-reload
+    systemctl enable x-ui
+    systemctl start x-ui
+    LOGI "x-ui v${last_version} 安装完成，面板已启动。"
+    echo -e "----------------------------------------------"
+    echo -e "x-ui start|stop|restart|status|enable|disable|log|update|install|uninstall|geo"
+    echo -e "----------------------------------------------"
+}
+
 install() {
-    bash <(curl -Ls https://raw.githubusercontent.com/FranzKafkaYu/x-ui/master/install.sh)
+    install_base
+    install_x-ui $1
     if [[ $? == 0 ]]; then
         if [[ $# == 0 ]]; then
             start
@@ -141,7 +294,8 @@ update() {
         fi
         return 0
     fi
-    bash <(curl -Ls https://raw.githubusercontent.com/FranzKafkaYu/x-ui/master/install.sh)
+    install_base
+    install_x-ui $1
     if [[ $? == 0 ]]; then
         LOGI "更新完成，已自动重启面板 "
         exit 0
@@ -323,6 +477,23 @@ migrate_v2_ui() {
 }
 
 install_bbr() {
+    # Armbian 使用定制内核 + u-boot 引导，换通用内核极易变砖，改为仅写 sysctl 开启 BBR
+    if [[ "${release}" == "debian" ]] && grep -Eqi "armbian" /etc/issue /etc/os-release /proc/version 2>/dev/null; then
+        LOGE "检测到 Armbian：跳过换内核操作（会破坏 u-boot 引导）。\n"
+        LOGE "如当前内核已支持 BBR，可直接写 sysctl 开启；否则请用 armbian-config 升级内核。\n"
+        local m=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
+        if [[ "${m}" == "bbr" ]]; then
+            LOGI "当前内核已启用 BBR。"
+        else
+            echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+            echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+            sysctl -p
+            LOGI "已写入 sysctl，若未生效说明内核不支持，请用 armbian-config 升级内核后重试。"
+        fi
+        echo ""
+        before_show_menu
+        return 0
+    fi
     # temporary workaround for installing bbr
     bash <(curl -L -s https://raw.githubusercontent.com/teddysun/across/master/bbr.sh)
     echo ""
