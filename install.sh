@@ -153,6 +153,21 @@ XUI_REPO="${XUI_REPO:-FranzKafkaYu/x-ui}"
 # armv7 上游无预编译包时，可把自行编译好的包路径传给本变量跳过下载
 XUI_LOCAL_TARBALL="${XUI_LOCAL_TARBALL:-}"
 
+# 获取最新版本：优先走 releases/latest 页面重定向（不受 api 限流影响），
+# 失败再回退到 api.github.com，仍失败则用写死的已知可用版本
+get_latest_version() {
+    local v=""
+    v=$(curl -Lsk -o /dev/null -w "%{url_effective}" "https://github.com/${XUI_REPO}/releases/latest" 2>/dev/null | sed -E 's#.*/tag/##; s#.*/releases/##')
+    if [[ -n "$v" && "$v" != "latest" ]]; then
+        echo "$v"; return 0
+    fi
+    v=$(curl -Lsk "https://api.github.com/repos/${XUI_REPO}/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    if [[ -n "$v" ]]; then
+        echo "$v"; return 0
+    fi
+    echo "0.3.4.4"; return 0
+}
+
 install_base() {
     if [[ x"${release}" == x"centos" ]]; then
         yum install -y wget curl tar jq cronie
@@ -206,8 +221,12 @@ build_x-ui_from_source() {
     fi
     cd x-ui-src || return 1
     GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -o x-ui . || return 1
-    # xray-core 官方 arm32-v7a 包
-    local xv=$(curl -Lsk "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    # xray-core 官方 arm32-v7a 包（同样用重定向取版本，避免 api 限流）
+    local xv
+    xv=$(curl -Lsk -o /dev/null -w "%{url_effective}" "https://github.com/XTLS/Xray-core/releases/latest" 2>/dev/null | sed -E 's#.*/tag/##; s#.*/releases/##')
+    if [[ -z "$xv" || "$xv" == "latest" ]]; then
+        xv=$(curl -Lsk "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    fi
     wget -N --no-check-certificate -O /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${xv}/Xray-linux-arm32-v7a.zip" || return 1
     command -v unzip >/dev/null 2>&1 && unzip -o /tmp/xray.zip -d /tmp/xray-arm >/dev/null || return 1
     mkdir -p bin
@@ -239,11 +258,7 @@ install_x-ui() {
         cp -f "${XUI_LOCAL_TARBALL}" /usr/local/x-ui-linux-${arch}.tar.gz
         LOGI "使用本地安装包: ${XUI_LOCAL_TARBALL}"
     elif [ $# == 0 ]; then
-        last_version=$(curl -Lsk "https://api.github.com/repos/${XUI_REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        if [[ -z "$last_version" ]]; then
-            LOGE "检测 x-ui 版本失败，可能是超出 Github API 限制，请稍后再试或手动指定版本安装。"
-            exit 1
-        fi
+        last_version=$(get_latest_version)
         LOGI "检测到 x-ui 最新版本：${last_version}，开始安装"
         wget -N --no-check-certificate -O /usr/local/x-ui-linux-${arch}.tar.gz "https://github.com/${XUI_REPO}/releases/download/${last_version}/x-ui-linux-${arch}.tar.gz"
     else
